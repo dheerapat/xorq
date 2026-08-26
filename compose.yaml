@@ -116,10 +116,22 @@ services:
       - $PWD/docker/trino/catalog/hive.properties:/etc/trino/catalog/hive.properties:ro
       - $PWD/docker/trino/jvm.config:/etc/trino/jvm.config:ro
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    ports:
+      - 8123:8123
+      - 9000:9000
+    healthcheck:
+      interval: 1s
+      retries: 20
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+    networks:
+      - clickhouse
+
 networks:
   postgres:
   trino:
-
+  clickhouse:
 
 volumes:
   postgres:
