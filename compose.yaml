@@ -122,12 +122,16 @@ services:
       - 8123:8123
       - 9000:9000
     environment:
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: defaultpass
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-defaultpass}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-default}
     healthcheck:
-      interval: 1s
+      interval: 2s
       retries: 20
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
     networks:
       - clickhouse
 
@@ -138,4 +142,6 @@ networks:
 
 volumes:
   postgres:
+  clickhouse_data:
+  clickhouse_logs:
 

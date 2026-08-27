@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Mapping
+import re
+import warnings
+from typing import TYPE_CHECKING, Any, Mapping
+from urllib.parse import parse_qs, urlsplit
 
 import pyarrow as pa
 import sqlglot as sg
-import sqlglot.expressions as sge
+
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 import xorq.vendor.ibis.expr.schema as sch
 from xorq.backends.clickhouse.compiler import compiler
@@ -77,6 +83,41 @@ def _arrow_type_to_clickhouse(t: pa.DataType) -> str:
     if pa.types.is_dictionary(t):
         return _arrow_type_to_clickhouse(t.value_type)
     return "String"
+
+
+def _ch_default_for_base(base: str) -> str | None:
+    """Return a DEFAULT literal for a ClickHouse base type, or None if no sensible default.
+
+    Per `schema-types-avoid-nullable`: use DEFAULT ''/0 instead of Nullable when
+    null semantics aren't required.
+    """
+    if base.startswith("LowCardinality("):
+        # LowCardinality(String) / LowCardinality(Nullable(String)) handled upstream; unwrap
+        inner = base[len("LowCardinality(") : -1]
+        # Recurse on inner for default, but LowCardinality(String) default is still ''
+        if "String" in inner:
+            return "''"
+        return _ch_default_for_base(inner)
+    if base == "String":
+        return "''"
+    if base == "Bool":
+        return "false"
+    if base.startswith("Int") or base.startswith("UInt"):
+        return "0"
+    if base.startswith("Float"):
+        return "0"
+    if base == "Date":
+        return "toDate(0)"
+    if base.startswith("DateTime64"):
+        m = re.search(r"DateTime64\((\d+)", base)
+        scale = m.group(1) if m else "3"
+        return f"toDateTime64(0, {scale})"
+    if base.startswith("DateTime"):
+        return "toDateTime(0)"
+    if base.startswith("Decimal"):
+        return "0"
+    # Arrays/Maps/Tuples: no default needed; ClickHouse defaults to empty
+    return None
 
 
 class _ClickHouseCursor:
@@ -215,19 +256,33 @@ class Backend(SQLBackend):
 
     # Scan/run-time caps applied to read queries (agent-query-safety). LIMIT is the
     # caller's responsibility via compile(); these are the real guardrails.
+    # Per `agent-query-safety`: max_rows_to_read/max_bytes_to_read are the scan caps,
+    # max_execution_time + timeout_before... is wall-clock, plus estimate + result caps.
     _READ_SETTINGS = {
         "max_execution_time": 30,
         "max_rows_to_read": 1_000_000_000,
         "max_bytes_to_read": 100_000_000_000,
         "timeout_before_checking_execution_speed": 0,
+        "max_estimated_execution_time": 60,
+        "max_result_rows": 10000,
+        "result_overflow_mode": "break",
     }
 
     def raw_sql(self, query: str | sg.Expression, **kwargs: Any) -> Any:
         if not isinstance(query, str):
             query = query.sql(dialect=self.dialect)
         # Cap scans/run time for read queries (agent-query-safety).
-        if query.lstrip().upper().startswith(("SELECT", "WITH")):
-            kwargs.setdefault("settings", {}).update(self._READ_SETTINGS)
+        # Strip leading comments/whitespace so "-- comment\nSELECT" still gets capped.
+        stripped = re.sub(
+            r"^\s*(?:--[^\n]*\n|\s|/\*.*?\*/)*", "", query, flags=re.DOTALL
+        ).lstrip()
+        if stripped.upper().startswith(("SELECT", "WITH", "EXPLAIN", "DESCRIBE")):
+            # Only SELECT/WITH need scan caps; EXPLAIN/DESCRIBE are cheap but also safe to cap
+            needs_cap = stripped.upper().startswith(("SELECT", "WITH"))
+            if needs_cap:
+                settings = kwargs.setdefault("settings", {})
+                for k, v in self._READ_SETTINGS.items():
+                    settings.setdefault(k, v)
         result = self.con.query(query, **kwargs)
         return _ClickHouseCursor(result)
 
@@ -249,7 +304,9 @@ class Backend(SQLBackend):
         # Fallback: DESCRIBE the SELECT to recover (name, type) pairs and map
         # them back to ibis types via the (working) `from_string` path.
         result = self.con.query(f"DESCRIBE {query}")
-        rows = result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        rows = (
+            result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        )
         return sch.Schema(
             {
                 name: self.compiler.type_mapper.from_string(col_type, nullable=True)
@@ -270,7 +327,9 @@ class Backend(SQLBackend):
         ).sql(dialect=self.dialect)
         # DESCRIBE returns (name, type, default_type, default_expression, comment, codec_expression, ttl_expression)
         result = self.con.query(f"DESCRIBE TABLE {ident}")
-        rows = result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        rows = (
+            result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        )
         type_mapper = self.compiler.type_mapper
         fields = {}
         for row in rows:
@@ -282,21 +341,101 @@ class Backend(SQLBackend):
         self, *, like: str | None = None, database: str | None = None
     ) -> list[str]:
         db = database or self._database
-        result = self.con.query(f"SHOW TABLES FROM {sg.to_identifier(db, quoted=self.compiler.quoted).sql(dialect=self.dialect)}")
-        rows = result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        result = self.con.query(
+            f"SHOW TABLES FROM {sg.to_identifier(db, quoted=self.compiler.quoted).sql(dialect=self.dialect)}"
+        )
+        rows = (
+            result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        )
         tables = [r[0] for r in rows]
         return self._filter_with_like(tables, like)
 
     def list_databases(self, *, like: str | None = None) -> list[str]:
         result = self.con.query("SHOW DATABASES")
-        rows = result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        rows = (
+            result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        )
         dbs = [r[0] for r in rows]
         return self._filter_with_like(dbs, like)
+
+    # --- agent-discovery-schema helpers (system.*) ---
+    def get_sorting_key(
+        self, table_name: str, *, database: str | None = None
+    ) -> dict[str, str]:
+        """Return sorting_key / primary_key / partition_key for a table.
+
+        Per `agent-discovery-schema` step 4: filtering on sort key allows granule skipping.
+        """
+        db = database or self._database
+        q = (
+            "SELECT sorting_key, primary_key, partition_key, engine "
+            "FROM system.tables WHERE database = {db:String} AND name = {tbl:String}"
+        )
+        result = self.con.query(q, parameters={"db": db, "tbl": table_name})
+        rows = (
+            result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        )
+        if not rows:
+            return {
+                "sorting_key": "",
+                "primary_key": "",
+                "partition_key": "",
+                "engine": "",
+            }
+        # columns: sorting_key, primary_key, partition_key, engine
+        return dict(
+            zip(["sorting_key", "primary_key", "partition_key", "engine"], rows[0])
+        )
+
+    def get_skipping_indices(
+        self, table_name: str, *, database: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return data skipping indices for a table (step 5 of discovery).
+
+        Per `query-index-skipping-indices`: bloom_filter / set / minmax / tokenbf.
+        """
+        db = database or self._database
+        q = (
+            "SELECT name, type, expr, granularity "
+            "FROM system.data_skipping_indices WHERE database = {db:String} AND table = {tbl:String}"
+        )
+        try:
+            result = self.con.query(q, parameters={"db": db, "tbl": table_name})
+        except Exception:
+            return []
+        rows = (
+            result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        )
+        cols = ["name", "type", "expr", "granularity"]
+        # clickhouse-connect may return result.column_names
+        if hasattr(result, "column_names") and result.column_names:
+            cols = list(result.column_names)
+        return [dict(zip(cols, r)) for r in rows]
+
+    def get_columns_with_comments(
+        self, table_name: str, *, database: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return columns with types and comments (step 3 of discovery)."""
+        db = database or self._database
+        q = (
+            "SELECT name, type, comment, position "
+            "FROM system.columns WHERE database = {db:String} AND table = {tbl:String} ORDER BY position"
+        )
+        result = self.con.query(q, parameters={"db": db, "tbl": table_name})
+        rows = (
+            result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        )
+        cols = ["name", "type", "comment", "position"]
+        if hasattr(result, "column_names") and result.column_names:
+            cols = list(result.column_names)
+        return [dict(zip(cols, r)) for r in rows]
 
     @property
     def version(self) -> str:
         result = self.con.query("SELECT version()")
-        rows = result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        rows = (
+            result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        )
         return rows[0][0] if rows else "unknown"
 
     @property
@@ -336,7 +475,9 @@ class Backend(SQLBackend):
         limit: int | str | None = None,
         **kwargs: Any,
     ) -> pa.Table:
-        return self.to_pyarrow_batches(expr, params=params, limit=limit, **kwargs).read_all()
+        return self.to_pyarrow_batches(
+            expr, params=params, limit=limit, **kwargs
+        ).read_all()
 
     def execute(
         self,
@@ -354,19 +495,54 @@ class Backend(SQLBackend):
         table_name: str | None = None,
         *,
         order_by: str = "tuple()",
+        partition_by: str | None = None,
+        low_cardinality_cols: list[str] | set[str] | None = None,
+        nullable_cols: set[str] | list[str] | bool | None = None,
+        skipping_indices: list[str] | None = None,
         chunk_size: int = 100_000,
         **kwargs: Any,
     ) -> ir.Table:
         """Ingest Arrow data into a ClickHouse table.
 
         ClickHouse ``INSERT`` does not auto-create tables, so we create an
-        explicit ``MergeTree`` table from the Arrow schema first. ``ORDER BY`` is
-        immutable after creation (schema-pk-plan-before-creation); for a generic
-        Arrow ingest with no known query pattern we default to ``tuple()``
-        (insertion order, no sparse index). Pass ``order_by`` to choose a real
-        sort key (low-cardinality filter columns first).
+        explicit ``MergeTree`` table from the Arrow schema first.
+
+        Per `schema-pk-plan-before-creation` ORDER BY is immutable — choose it before
+        creation based on query patterns. `tuple()` means no sparse index (full scan).
+        Pass low-cardinality string columns via `low_cardinality_cols` (per
+        `schema-types-lowcardinality`) and control nullability via `nullable_cols`
+        (per `schema-types-avoid-nullable`).
+
+        Parameters
+        ----------
+        order_by
+            ORDER BY expression. Default ``tuple()`` = no primary index. For real
+            workloads pass e.g. ``"event_type, toDate(timestamp), user_id"`` with
+            low-cardinality columns first (per `schema-pk-cardinality-order`).
+        partition_by
+            Optional PARTITION BY expression (e.g. ``"toYYYYMM(timestamp)"``).
+            Per `schema-partition-*` keep cardinality <1k and prefer monthly over
+            daily. ``None`` = no partitioning (recommended to start per
+            `schema-partition-start-without`).
+        low_cardinality_cols
+            Column names that should be ``LowCardinality(String)`` (<10k uniques).
+        nullable_cols
+            ``None`` = auto (Nullable only if Arrow field is nullable AND data contains nulls).
+            ``True``/``False`` = force all/none. ``set`` = allowlist.
+        skipping_indices
+            Raw ``INDEX name expr TYPE type GRANULARITY N`` clauses (per
+            `query-index-skipping-indices`).
         """
         from xorq.vendor.ibis.util import gen_name  # noqa: PLC0415
+
+        if order_by == "tuple()":
+            warnings.warn(
+                "ORDER BY tuple() disables the sparse primary index (full scans). "
+                "Pass `order_by` matching your filter columns; see schema-pk-plan-before-creation. "
+                "Immutable after creation — requires table migration to fix.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         table_name = table_name or gen_name("clickhouse_memtable")
         table = (
@@ -375,12 +551,40 @@ class Backend(SQLBackend):
             else record_batches
         )
 
+        # Per `schema-types-avoid-nullable` and `allow_nullable_key` restriction:
+        # ORDER BY / PARTITION BY columns must be non-nullable. Force them to non-nullable
+        # even if caller asked for Nullable or data contains nulls.
+        raw_keys = f"{order_by} {partition_by or ''}"
+        key_cols = {f.name for f in table.schema if f.name in raw_keys}
+
         columns = ", ".join(
-            self._arrow_field_to_clickhouse(f.name, f) for f in table.schema
+            self._arrow_field_to_clickhouse(
+                f.name,
+                f,
+                table=table,
+                low_cardinality_cols=(
+                    set(low_cardinality_cols) if low_cardinality_cols else None
+                ),
+                nullable_cols=(
+                    set(nullable_cols)
+                    if isinstance(nullable_cols, (list, set, tuple))
+                    else nullable_cols
+                ),
+                force_non_nullable=(f.name in key_cols),
+            )
+            for f in table.schema
         )
+        idx_sql = ""
+        if skipping_indices:
+            idx_sql = ", " + ", ".join(skipping_indices)
+        part_sql = f" PARTITION BY {partition_by}" if partition_by else ""
+        # Normalize ORDER BY: multi-column needs parentheses, single col works either way
+        ob = order_by.strip()
+        if ob != "tuple()" and not (ob.startswith("(") and ob.endswith(")")):
+            ob = f"({ob})"
         ddl = (
-            f"CREATE TABLE IF NOT EXISTS {table_name} ({columns}) "
-            f"ENGINE = MergeTree ORDER BY {order_by}"
+            f"CREATE TABLE IF NOT EXISTS {table_name} ({columns}{idx_sql}) "
+            f"ENGINE = MergeTree{part_sql} ORDER BY {ob}"
         )
         self.con.command(ddl)
 
@@ -391,13 +595,65 @@ class Backend(SQLBackend):
         return self.table(table_name)
 
     @staticmethod
-    def _arrow_field_to_clickhouse(name: str, field: pa.Field) -> str:
+    def _arrow_field_to_clickhouse(
+        name: str,
+        field: pa.Field,
+        *,
+        table: pa.Table | None = None,
+        low_cardinality_cols: set[str] | None = None,
+        nullable_cols: set[str] | bool | None = None,
+        force_non_nullable: bool = False,
+    ) -> str:
         base = _arrow_type_to_clickhouse(field.type)
-        # Nested types (Array/Map/Struct) cannot be Nullable in ClickHouse.
-        nullable = field.nullable and not _arrow_is_nested(field.type)
-        ch_type = f"Nullable({base})" if nullable else base
-        ident = sg.to_identifier(name, quoted=True)
-        return f"{ident.sql(dialect='clickhouse')} {ch_type}"
+        is_nested = _arrow_is_nested(field.type)
+
+        # LowCardinality handling (schema-types-lowcardinality): only String benefits
+        if low_cardinality_cols and name in low_cardinality_cols and base == "String":
+            base = "LowCardinality(String)"
+
+        # Determine nullability (schema-types-avoid-nullable)
+        if force_non_nullable:
+            nullable = False
+        elif is_nested:
+            nullable = False
+        else:
+            if isinstance(nullable_cols, bool):
+                nullable = field.nullable and nullable_cols
+            elif isinstance(nullable_cols, (set, list, tuple)):
+                nullable = name in nullable_cols and field.nullable
+            else:  # None = auto
+                if table is not None:
+                    try:
+                        col = table.column(name)
+                        has_nulls = col.null_count > 0
+                    except Exception:
+                        has_nulls = False
+                    nullable = field.nullable and has_nulls
+                else:
+                    nullable = field.nullable
+
+        # Build type string — LowCardinality(Nullable(...)) is correct order
+        if nullable:
+            if base.startswith("LowCardinality("):
+                inner = base[len("LowCardinality(") : -1]
+                ch_type = f"LowCardinality(Nullable({inner}))"
+            else:
+                ch_type = f"Nullable({base})"
+            # Nullable columns don't need DEFAULT
+            ident = sg.to_identifier(name, quoted=True)
+            return f"{ident.sql(dialect='clickhouse')} {ch_type}"
+        else:
+            # Non-nullable: add DEFAULT to avoid Nullable overhead (schema-types-avoid-nullable)
+            # Only emit DEFAULT if original field was nullable (i.e., we are optimizing away Nullable)
+            # Pure non-nullable fields could also just be type without DEFAULT, but explicit DEFAULT is clearer.
+            default = None
+            if field.nullable:
+                # we have chosen to make it non-nullable despite Arrow saying nullable but no nulls in data
+                default = _ch_default_for_base(base)
+            ident = sg.to_identifier(name, quoted=True)
+            if default is not None:
+                return f"{ident.sql(dialect='clickhouse')} {base} DEFAULT {default}"
+            return f"{ident.sql(dialect='clickhouse')} {base}"
 
     def create_table(
         self,
@@ -408,6 +664,11 @@ class Backend(SQLBackend):
         database: str | None = None,
         temp: bool = False,
         overwrite: bool = False,
+        order_by: str = "tuple()",
+        partition_by: str | None = None,
+        low_cardinality_cols: list[str] | set[str] | None = None,
+        nullable_cols: set[str] | list[str] | bool | None = None,
+        skipping_indices: list[str] | None = None,
     ) -> ir.Table:
         """Create a table, optionally populating it from ``obj``.
 
@@ -415,11 +676,21 @@ class Backend(SQLBackend):
         ``MergeTree`` DDL from the data/schema. Types are mapped via Arrow (the
         vendored ibis ClickHouse ``from_ibis`` mapper is incompatible with the
         pinned sqlglot), so ``obj`` or ``schema`` is converted to a pyarrow
-        schema first. ``ORDER BY tuple()`` is the default (see
-        ``read_record_batches`` for the immutability caveat); pass a real key
-        by creating the table manually via ``raw_sql``.
+        schema first.
+
+        Per `schema-pk-plan-before-creation` ORDER BY is immutable — pass a real
+        key (e.g. ``"user_id, event_date"``) for filter-heavy workloads. ``tuple()``
+        is insertion-order with no sparse index.
         """
         import pandas as pd  # noqa: PLC0415
+
+        if order_by == "tuple()":
+            warnings.warn(
+                "ORDER BY tuple() disables the sparse primary index. "
+                "Pass `order_by` matching your filter columns; immutable after creation.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         if schema is not None:
             schema = sch.schema(schema)
@@ -434,21 +705,52 @@ class Backend(SQLBackend):
             if isinstance(obj, pa.RecordBatchReader):
                 obj = obj.read_all()
             arrow_schema = obj.schema
+            arrow_table_for_nulls = obj
         else:
             # ibis schema -> pyarrow (working path) -> ClickHouse types
             arrow_schema = sch.schema(schema).to_pyarrow()
+            arrow_table_for_nulls = None
 
         ident = sg.table(name, db=database, quoted=self.compiler.quoted).sql(
             dialect=self.dialect
         )
+        lc_set = set(low_cardinality_cols) if low_cardinality_cols else None
+        nc_val: set[str] | bool | None
+        if isinstance(nullable_cols, (list, set, tuple)):
+            nc_val = set(nullable_cols)
+        else:
+            nc_val = nullable_cols
+        raw_keys = f"{order_by} {partition_by or ''}"
+        key_cols = {f.name for f in arrow_schema if f.name in raw_keys}
         columns = ", ".join(
-            self._arrow_field_to_clickhouse(f.name, f) for f in arrow_schema
+            self._arrow_field_to_clickhouse(
+                f.name,
+                f,
+                table=arrow_table_for_nulls,
+                low_cardinality_cols=lc_set,
+                nullable_cols=nc_val,
+                force_non_nullable=(f.name in key_cols),
+            )
+            for f in arrow_schema
         )
+        idx_sql = ""
+        if skipping_indices:
+            idx_sql = ", " + ", ".join(skipping_indices)
+        part_sql = f" PARTITION BY {partition_by}" if partition_by else ""
+        ob = order_by.strip()
+        if ob != "tuple()" and not (ob.startswith("(") and ob.endswith(")")):
+            ob = f"({ob})"
         if overwrite:
             self.con.command(f"DROP TABLE IF EXISTS {ident}")
-        # ponytail: `temp` not wired to CREATE TEMPORARY TABLE — create permanent.
+        if temp:
+            warnings.warn(
+                "ClickHouse TEMPORARY TABLE requested but `temp=True` is not fully wired; "
+                "creating as MergeTree with ORDER BY. Use raw_sql for TEMPORARY if needed.",
+                UserWarning,
+                stacklevel=2,
+            )
         self.con.command(
-            f"CREATE TABLE {ident} ({columns}) ENGINE = MergeTree ORDER BY tuple()"
+            f"CREATE TABLE {ident} ({columns}{idx_sql}) ENGINE = MergeTree{part_sql} ORDER BY {ob}"
         )
         if obj is not None:
             for start in range(0, obj.num_rows, 100_000):
@@ -457,8 +759,6 @@ class Backend(SQLBackend):
 
     @staticmethod
     def _from_url(url: str) -> dict[str, Any]:
-        from urllib.parse import parse_qs, urlsplit
-
         parsed = urlsplit(url)
         kwargs: dict[str, Any] = {}
         if parsed.hostname:
