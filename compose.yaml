@@ -117,10 +117,13 @@ services:
       - $PWD/docker/trino/jvm.config:/etc/trino/jvm.config:ro
 
   clickhouse:
-    image: clickhouse/clickhouse-server:24-alpine
+    image: clickhouse/clickhouse-server:25.8
     ports:
       - 8123:8123
       - 9000:9000
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: defaultpass
     healthcheck:
       interval: 1s
       retries: 20

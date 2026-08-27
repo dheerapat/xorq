@@ -16,6 +16,69 @@ from xorq.vendor.ibis.expr import types as ir
 __all__ = ["Backend", "connect"]
 
 
+# Arrow -> ClickHouse type mapping used to CREATE TABLE from ingested Arrow data.
+# The vendored ibis ClickHouse type mapper's `from_ibis` is incompatible with the
+# pinned sqlglot (it references a removed `NULLABLE` typecode), so we map pyarrow
+# types directly for DDL generation instead of going through the broken mapper.
+_ARROW_UNIT_SCALE = {"s": 0, "ms": 3, "us": 6, "ns": 9}
+
+
+def _arrow_is_nested(t: pa.DataType) -> bool:
+    return (
+        pa.types.is_list(t)
+        or pa.types.is_large_list(t)
+        or pa.types.is_map(t)
+        or pa.types.is_struct(t)
+    )
+
+
+def _arrow_type_to_clickhouse(t: pa.DataType) -> str:
+    if pa.types.is_int8(t):
+        return "Int8"
+    if pa.types.is_int16(t):
+        return "Int16"
+    if pa.types.is_int32(t):
+        return "Int32"
+    if pa.types.is_int64(t):
+        return "Int64"
+    if pa.types.is_uint8(t):
+        return "UInt8"
+    if pa.types.is_uint16(t):
+        return "UInt16"
+    if pa.types.is_uint32(t):
+        return "UInt32"
+    if pa.types.is_uint64(t):
+        return "UInt64"
+    if pa.types.is_float16(t):
+        return "Float32"
+    if pa.types.is_float32(t):
+        return "Float32"
+    if pa.types.is_float64(t):
+        return "Float64"
+    if pa.types.is_boolean(t):
+        return "Bool"
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
+        return "String"
+    if pa.types.is_binary(t) or pa.types.is_large_binary(t):
+        return "String"
+    if pa.types.is_date(t) or pa.types.is_date32(t) or pa.types.is_date64(t):
+        return "Date"
+    if pa.types.is_timestamp(t):
+        return f"DateTime64({_ARROW_UNIT_SCALE.get(t.unit, 3)})"
+    if pa.types.is_decimal(t):
+        return f"Decimal({t.precision},{t.scale})"
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return f"Array({_arrow_type_to_clickhouse(t.value_type)})"
+    if pa.types.is_map(t):
+        return f"Map({_arrow_type_to_clickhouse(t.key_type)}, {_arrow_type_to_clickhouse(t.item_type)})"
+    if pa.types.is_struct(t):
+        inner = ", ".join(f"{f.name} {_arrow_type_to_clickhouse(f.type)}" for f in t)
+        return f"Tuple({inner})"
+    if pa.types.is_dictionary(t):
+        return _arrow_type_to_clickhouse(t.value_type)
+    return "String"
+
+
 class _ClickHouseCursor:
     """Thin DB-API-like wrapper around clickhouse-connect result."""
 
@@ -150,10 +213,21 @@ class Backend(SQLBackend):
         except Exception:
             pass
 
+    # Scan/run-time caps applied to read queries (agent-query-safety). LIMIT is the
+    # caller's responsibility via compile(); these are the real guardrails.
+    _READ_SETTINGS = {
+        "max_execution_time": 30,
+        "max_rows_to_read": 1_000_000_000,
+        "max_bytes_to_read": 100_000_000_000,
+        "timeout_before_checking_execution_speed": 0,
+    }
+
     def raw_sql(self, query: str | sg.Expression, **kwargs: Any) -> Any:
         if not isinstance(query, str):
             query = query.sql(dialect=self.dialect)
-        # clickhouse_connect
+        # Cap scans/run time for read queries (agent-query-safety).
+        if query.lstrip().upper().startswith(("SELECT", "WITH")):
+            kwargs.setdefault("settings", {}).update(self._READ_SETTINGS)
         result = self.con.query(query, **kwargs)
         return _ClickHouseCursor(result)
 
@@ -163,29 +237,25 @@ class Backend(SQLBackend):
             yield cur
 
     def _get_schema_using_query(self, query: str) -> sch.Schema:
-        # ponytail: minimal— run query with LIMIT 0 and infer from Arrow
-        # ClickHouse supports DESCRIBE but LIMIT 0 is dialect-agnostic
+        # Infer types from an Arrow result over a zero-row subquery. ClickHouse
+        # returns correct column types even with no rows, so we avoid the
+        # all-String fallback (schema-types-native-types).
         limited = f"SELECT * FROM ({query}) AS _t LIMIT 0"
         try:
-            result = self.con.query(limited)
-            # try arrow
-            if hasattr(result, "to_arrow_table"):
-                arrow_table = result.to_arrow_table()
-                return sch.Schema.from_pyarrow(arrow_table.schema)
-            # fallback: column_names + column_types
-            if hasattr(result, "column_names"):
-                # infer types via ClickHouse type mapper from empty result is hard;
-                # fallback to string
-                import xorq.vendor.ibis.expr.datatypes as dt
-
-                return sch.Schema(
-                    {name: dt.string for name in result.column_names}
-                )
+            arrow_table = self.con.query_arrow(limited)
+            return sch.Schema.from_pyarrow(arrow_table.schema)
         except Exception:
             pass
-        # fallback: ask ClickHouse DESCRIBE
-        # parse table name from query is fragile, just return empty
-        raise NotImplementedError("Cannot infer schema for query: " + query[:200])
+        # Fallback: DESCRIBE the SELECT to recover (name, type) pairs and map
+        # them back to ibis types via the (working) `from_string` path.
+        result = self.con.query(f"DESCRIBE {query}")
+        rows = result.result_rows if hasattr(result, "result_rows") else result.fetchall()
+        return sch.Schema(
+            {
+                name: self.compiler.type_mapper.from_string(col_type, nullable=True)
+                for name, col_type in ((r[0], r[1]) for r in rows)
+            }
+        )
 
     def get_schema(
         self,
@@ -244,17 +314,13 @@ class Backend(SQLBackend):
     ) -> pa.ipc.RecordBatchReader:
         self._run_pre_execute_hooks(expr)
         sql = self.compile(expr, params=params, limit=limit)
-        result = self.con.query(sql)
-        # native arrow path (clickhouse-connect >=0.8 with use_arrow)
-        if hasattr(result, "to_arrow_table"):
-            table = result.to_arrow_table()
+        # Native Arrow read (clickhouse-connect >=0.8 query_arrow). Adds safety
+        # scan caps (agent-query-safety) without forcing a row LIMIT.
+        if hasattr(self.con, "query_arrow"):
+            table = self.con.query_arrow(sql, settings=self._READ_SETTINGS)
             if isinstance(table, pa.Table):
                 return table.to_reader()
-            # fallback: pandas-like
-            import pandas as pd  # noqa: PLC0415
-
-            df = table.to_pandas() if hasattr(table, "to_pandas") else pd.DataFrame(table)
-            return pa.Table.from_pandas(df, preserve_index=False).to_reader()
+        result = self.con.query(sql)
         if hasattr(result, "result_rows"):
             import pandas as pd  # noqa: PLC0415
 
@@ -286,26 +352,129 @@ class Backend(SQLBackend):
         self,
         record_batches: pa.RecordBatchReader | pa.Table,
         table_name: str | None = None,
+        *,
+        order_by: str = "tuple()",
+        chunk_size: int = 100_000,
         **kwargs: Any,
     ) -> ir.Table:
-        """Ingest Arrow data into ClickHouse via ``insert_arrow``."""
+        """Ingest Arrow data into a ClickHouse table.
+
+        ClickHouse ``INSERT`` does not auto-create tables, so we create an
+        explicit ``MergeTree`` table from the Arrow schema first. ``ORDER BY`` is
+        immutable after creation (schema-pk-plan-before-creation); for a generic
+        Arrow ingest with no known query pattern we default to ``tuple()``
+        (insertion order, no sparse index). Pass ``order_by`` to choose a real
+        sort key (low-cardinality filter columns first).
+        """
         from xorq.vendor.ibis.util import gen_name  # noqa: PLC0415
 
         table_name = table_name or gen_name("clickhouse_memtable")
-        if isinstance(record_batches, pa.RecordBatchReader):
-            table = record_batches.read_all()
-        else:
-            table = record_batches
-        # ponytail: minimal— create table implicitly via insert; ClickHouse will create if not exists with MergeTree
-        # Use client.insert_arrow if available, else fallback to insert
-        if hasattr(self.con, "insert_arrow"):
-            self.con.insert_arrow(table_name, table)
-        elif hasattr(self.con, "insert"):
-            # convert to pandas for generic insert
-            self.con.insert(table_name, table.to_pandas())
-        else:
-            raise RuntimeError("ClickHouse client does not support insert_arrow/insert")
+        table = (
+            record_batches.read_all()
+            if isinstance(record_batches, pa.RecordBatchReader)
+            else record_batches
+        )
+
+        columns = ", ".join(
+            self._arrow_field_to_clickhouse(f.name, f) for f in table.schema
+        )
+        ddl = (
+            f"CREATE TABLE IF NOT EXISTS {table_name} ({columns}) "
+            f"ENGINE = MergeTree ORDER BY {order_by}"
+        )
+        self.con.command(ddl)
+
+        # Batch inserts (insert-batch-size: ~100K rows per part).
+        for start in range(0, table.num_rows, chunk_size):
+            self.con.insert_arrow(table_name, table.slice(start, chunk_size))
+
         return self.table(table_name)
+
+    @staticmethod
+    def _arrow_field_to_clickhouse(name: str, field: pa.Field) -> str:
+        base = _arrow_type_to_clickhouse(field.type)
+        # Nested types (Array/Map/Struct) cannot be Nullable in ClickHouse.
+        nullable = field.nullable and not _arrow_is_nested(field.type)
+        ch_type = f"Nullable({base})" if nullable else base
+        ident = sg.to_identifier(name, quoted=True)
+        return f"{ident.sql(dialect='clickhouse')} {ch_type}"
+
+    def create_table(
+        self,
+        name: str,
+        obj: pd.DataFrame | pa.Table | pa.RecordBatchReader | ir.Table | None = None,
+        *,
+        schema: sch.SchemaLike | None = None,
+        database: str | None = None,
+        temp: bool = False,
+        overwrite: bool = False,
+    ) -> ir.Table:
+        """Create a table, optionally populating it from ``obj``.
+
+        ClickHouse has no auto-create on insert, so we build an explicit
+        ``MergeTree`` DDL from the data/schema. Types are mapped via Arrow (the
+        vendored ibis ClickHouse ``from_ibis`` mapper is incompatible with the
+        pinned sqlglot), so ``obj`` or ``schema`` is converted to a pyarrow
+        schema first. ``ORDER BY tuple()`` is the default (see
+        ``read_record_batches`` for the immutability caveat); pass a real key
+        by creating the table manually via ``raw_sql``.
+        """
+        import pandas as pd  # noqa: PLC0415
+
+        if schema is not None:
+            schema = sch.schema(schema)
+        if obj is None and schema is None:
+            raise ValueError("Either `obj` or `schema` must be specified")
+
+        if obj is not None:
+            if isinstance(obj, ir.Expr):
+                obj = self.to_pyarrow(obj)
+            elif isinstance(obj, pd.DataFrame):
+                obj = pa.Table.from_pandas(obj, preserve_index=False)
+            if isinstance(obj, pa.RecordBatchReader):
+                obj = obj.read_all()
+            arrow_schema = obj.schema
+        else:
+            # ibis schema -> pyarrow (working path) -> ClickHouse types
+            arrow_schema = sch.schema(schema).to_pyarrow()
+
+        ident = sg.table(name, db=database, quoted=self.compiler.quoted).sql(
+            dialect=self.dialect
+        )
+        columns = ", ".join(
+            self._arrow_field_to_clickhouse(f.name, f) for f in arrow_schema
+        )
+        if overwrite:
+            self.con.command(f"DROP TABLE IF EXISTS {ident}")
+        # ponytail: `temp` not wired to CREATE TEMPORARY TABLE — create permanent.
+        self.con.command(
+            f"CREATE TABLE {ident} ({columns}) ENGINE = MergeTree ORDER BY tuple()"
+        )
+        if obj is not None:
+            for start in range(0, obj.num_rows, 100_000):
+                self.con.insert_arrow(name, obj.slice(start, 100_000))
+        return self.table(name, database=database)
+
+    @staticmethod
+    def _from_url(url: str) -> dict[str, Any]:
+        from urllib.parse import parse_qs, urlsplit
+
+        parsed = urlsplit(url)
+        kwargs: dict[str, Any] = {}
+        if parsed.hostname:
+            kwargs["host"] = parsed.hostname
+        if parsed.port:
+            kwargs["port"] = parsed.port
+        if parsed.username is not None:
+            kwargs["username"] = parsed.username
+        if parsed.password is not None:
+            kwargs["password"] = parsed.password
+        if parsed.path and parsed.path != "/":
+            kwargs["database"] = parsed.path.lstrip("/")
+        qs = parse_qs(parsed.query)
+        if "secure" in qs:
+            kwargs["secure"] = qs["secure"][0].lower() == "true"
+        return kwargs
 
     @classmethod
     def connect_env(cls, **kwargs: Any):
