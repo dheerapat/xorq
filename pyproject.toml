@@ -147,7 +147,7 @@ trino = [
     "trino==0.336.0",
 ]
 clickhouse = [
-    "clickhouse-connect>=0.8.0",
+    "clickhouse-connect>=1.7.2,<2",
 ]
 bigquery = [
     # >=1.8: manifest-based driver resolution for dbapi.connect(driver="bigquery")
