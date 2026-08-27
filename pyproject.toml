@@ -146,6 +146,9 @@ geospatial = [
 trino = [
     "trino==0.336.0",
 ]
+clickhouse = [
+    "clickhouse-connect>=1.7.2,<2",
+]
 bigquery = [
     # >=1.8: manifest-based driver resolution for dbapi.connect(driver="bigquery")
     # (the driver is installed out-of-band via `dbc install bigquery`)
@@ -222,6 +225,7 @@ pyiceberg = "xorq.backends.pyiceberg"
 sqlite = "xorq.backends.sqlite"
 gizmosql = "xorq.backends.gizmosql"
 databricks = "xorq.backends.databricks"
+clickhouse = "xorq.backends.clickhouse"
 bigquery = "xorq.backends.bigquery"
 
 [project.scripts]

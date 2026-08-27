@@ -116,11 +116,32 @@ services:
       - $PWD/docker/trino/catalog/hive.properties:/etc/trino/catalog/hive.properties:ro
       - $PWD/docker/trino/jvm.config:/etc/trino/jvm.config:ro
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    ports:
+      - 8123:8123
+      - 9000:9000
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-defaultpass}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-default}
+    healthcheck:
+      interval: 2s
+      retries: 20
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    networks:
+      - clickhouse
+
 networks:
   postgres:
   trino:
-
+  clickhouse:
 
 volumes:
   postgres:
+  clickhouse_data:
+  clickhouse_logs:
 
